@@ -6,7 +6,7 @@ from src.models.user import User
 from src.models.source import Source
 from src.models.record import Record
 from src.models.run import Run
-from src.models import note,audit
+from src.models import note,audit,bias
 from src.utils.security import hash_password
 from src.utils.serialization import now
 from src.services.runs import queue
@@ -52,8 +52,54 @@ def seed():
             if batch==0 and not db.scalar(select(Run.id).where(Run.name=='首轮种子研究')):
                 records=[{'id':r.id,'source_id':r.source_id,'reference':r.reference,'values':r.values} for r in db.scalars(select(Record).where(Record.source_id==source.id).order_by(Record.id))]
                 run=Run(source_id=source.id,name='首轮种子研究',state='queued',parameters=CONFIG['default_parameters'],snapshot={'source':{'id':source.id,'name':source.name,'filename':source.filename},'records':records},created_at=now());db.add(run);db.flush();queued.append(run.id)
+        seed_bias_demo(db)
         db.commit();print(json.dumps(counts(db),ensure_ascii=False))
     for id in queued:
         try:queue.rpush('analysis:queue',id)
         except Exception:logging.exception('seed queue unavailable')
+
+
+def seed_bias_demo(db):
+    """计时器偏差模块演示数据：两表 + 差值规则 + 一批试件 + 一次已完成极值分析。"""
+    from src.models.bias import Timer, TimerPairRule, BiasSpecimen, BiasAnalysis
+    from src.services.bias import _build_snapshot
+    from src.services.bias_solver import solve, CalibrationConflict, SolverBudgetError
+    if db.scalar(select(Timer.id).where(Timer.code == 'TM-A')):
+        return
+    t_a = Timer(code='TM-A', name='甲号计时器', bias_min=-3.0, bias_max=3.0,
+                version=1, updated_at=now())
+    t_b = Timer(code='TM-B', name='乙号计时器', bias_min=-2.5, bias_max=2.5,
+                version=1, updated_at=now())
+    db.add_all([t_a, t_b]); db.flush()
+    db.add(TimerPairRule(timer_a_id=t_a.id, timer_b_id=t_b.id,
+                         diff_min=-1.5, diff_max=1.5, version=1, updated_at=now()))
+    rng = random.Random(2026)
+    specs = []
+    for i in range(24):
+        tid = t_a.id if i % 2 == 0 else t_b.id
+        reading = round(50 + rng.gauss(4, 9), 2)
+        specs.append(BiasSpecimen(batch_key='BIAS-DEMO-01',
+                                  reference='SP-%03d' % (i + 1), timer_id=tid,
+                                  reading=reading, lower=48.0, upper=62.0))
+    db.add_all(specs); db.flush()
+    snapshot = _build_snapshot(db, 'BIAS-DEMO-01')
+    timers = {str(t['id']): {'name': t['name'], 'bias_min': t['bias_min'], 'bias_max': t['bias_max']}
+              for t in snapshot['timers']}
+    samples = [{'reference': s['reference'], 'timer_id': str(s['timer_id']),
+                'reading': s['reading'], 'lower': s['lower'], 'upper': s['upper']}
+               for s in snapshot['specimens']]
+    pair_rules = [{'timer_a': str(r['timer_a_id']), 'timer_b': str(r['timer_b_id']),
+                   'diff_min': r['diff_min'], 'diff_max': r['diff_max']}
+                  for r in snapshot['pair_rules']]
+    analysis = BiasAnalysis(name='演示批次偏差极值', batch_key='BIAS-DEMO-01',
+                            window_label='48–62 min（含两端）', state='queued',
+                            snapshot=snapshot, created_by='analyst@' + CONFIG['slug'] + '.demo',
+                            created_at=now(), publish_state='unpublished')
+    db.add(analysis); db.flush()
+    try:
+        analysis.result = solve(samples, timers, pair_rules)
+        analysis.state = 'completed'
+    except (CalibrationConflict, SolverBudgetError) as e:
+        analysis.state = 'conflict'
+        analysis.conflict_reason = str(e)
 if __name__=='__main__':seed()
